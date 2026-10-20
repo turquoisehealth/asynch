@@ -1,4 +1,6 @@
+import asyncio
 import re
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import cast
@@ -8,6 +10,7 @@ import pytest
 
 from asynch.proto.connection import Connection as ProtoConnection
 from asynch.proto.cs import ServerInfo
+from asynch.proto.streams.buffered import BufferedReader, BufferedWriter
 
 
 @pytest.fixture()
@@ -160,3 +163,25 @@ async def test_watch_zero_limit(proto_conn: ProtoConnection) -> None:
     results = await proto_conn.execute_iter("WATCH lv LIMIT 0")
     async for data in results:
         assert data == (10, 1)
+
+
+@pytest.mark.asyncio
+async def test_ping_fails_fast_on_a_silent_peer() -> None:
+    # A peer that keeps the socket open but never answers, like a connection the network dropped silently
+    peers: list[asyncio.StreamWriter] = []
+    server = await asyncio.start_server(lambda reader, writer: peers.append(writer), host="127.0.0.1", port=0)
+    host, port = server.sockets[0].getsockname()[:2]
+    conn = ProtoConnection(host=host, port=port, sync_request_timeout=1)
+    reader, writer = await asyncio.open_connection(host, port)
+    conn.reader, conn.writer, conn.connected = BufferedReader(reader), BufferedWriter(writer), True
+
+    started = time.monotonic()
+    assert await asyncio.wait_for(conn.ping(), timeout=3) is False
+    assert time.monotonic() - started < 3
+    assert not conn.connected
+
+    # Python 3.12+ waits for open client connections in wait_closed
+    for peer in peers:
+        peer.close()
+    server.close()
+    await server.wait_closed()
